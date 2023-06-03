@@ -341,9 +341,7 @@ class StableDiffusionProcessing:
         self.c = self.get_conds_with_caching(prompt_parser.get_multicond_learned_conditioning, self.prompts, self.steps * self.step_multiplier, self.cached_c, self.extra_network_data)
 
     def parse_extra_network_prompts(self):
-        self.prompts, extra_network_data = extra_networks.parse_prompts(self.prompts)
-
-        return extra_network_data
+        self.prompts, self.extra_network_data = extra_networks.parse_prompts(self.prompts)
 
 
 class Processed:
@@ -705,7 +703,7 @@ def process_images_inner(p: StableDiffusionProcessing) -> Processed:
             if len(p.prompts) == 0:
                 break
 
-            p.extra_network_data = p.parse_extra_network_prompts()
+            p.parse_extra_network_prompts()
 
             if not p.disable_extra_networks:
                 with devices.autocast():
