@@ -1,0 +1,4 @@
+﻿name,prompt,negative_prompt
+None,,
+基础,"best quality, ","(nude:1.5),(nsfw:1.5),(clothes open:1.5),(breasts out:1.5), easynegative, ng_deepnegative_v1_75t,"
+nude,"1girl,best quality,(nude:1.5),(nsfw:1.5),(clothes open:1.5),(breasts out:1.5)"," easynegative, ng_deepnegative_v1_75t,"
