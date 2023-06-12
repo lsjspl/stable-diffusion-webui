@@ -516,6 +516,10 @@ class Api:
         return options
 
     def set_config(self, req: Dict[str, Any]):
+        checkpoint_key="sd_model_checkpoint"
+        if checkpoint_key in req and  str(req[checkpoint_key]) not in checkpoint_alisases:
+            raise RuntimeError(f"model {v!r} not found")
+
         for k, v in req.items():
             shared.opts.set(k, v)
 
