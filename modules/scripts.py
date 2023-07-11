@@ -1,6 +1,7 @@
 import os
 import re
 import sys
+import inspect
 from collections import namedtuple
 
 import gradio as gr
@@ -269,7 +270,7 @@ def load_scripts():
 
     def register_scripts_from_module(module):
         for script_class in module.__dict__.values():
-            if type(script_class) != type:
+            if not inspect.isclass(script_class):
                 continue
 
             if issubclass(script_class, Script):
