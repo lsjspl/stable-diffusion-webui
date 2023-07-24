@@ -1,5 +1,5 @@
 import json
-import os.path
+import os
 import threading
 import time
 from datetime import datetime
@@ -325,17 +325,6 @@ def normalize_git_url(url):
     return url
 
 
-def github_proxy(url):
-    proxy = shared.opts.github_proxy
-
-    if proxy == 'None':
-        return url
-    if proxy == 'ghproxy.com':
-        return "https://ghproxy.com/" + url
-
-    return url.replace('github.com', proxy)
-
-
 def install_extension_from_url(dirname, url, branch_name=None):
     check_access()
 
@@ -345,8 +334,6 @@ def install_extension_from_url(dirname, url, branch_name=None):
         url = url.strip()
 
     assert url, 'No URL specified'
-
-    url = github_proxy(url)
 
     if dirname is None or dirname == "":
         *parts, last_part = url.split('/')
@@ -367,12 +354,12 @@ def install_extension_from_url(dirname, url, branch_name=None):
         shutil.rmtree(tmpdir, True)
         if not branch_name:
             # if no branch is specified, use the default branch
-            with git.Repo.clone_from(url, tmpdir, filter=['blob:none'], verbose=False) as repo:
+            with git.Repo.clone_from(url, tmpdir, filter=['blob:none']) as repo:
                 repo.remote().fetch()
                 for submodule in repo.submodules:
                     submodule.update()
         else:
-            with git.Repo.clone_from(url, tmpdir, filter=['blob:none'], branch=branch_name, verbose=False) as repo:
+            with git.Repo.clone_from(url, tmpdir, filter=['blob:none'], branch=branch_name) as repo:
                 repo.remote().fetch()
                 for submodule in repo.submodules:
                     submodule.update()
@@ -526,14 +513,8 @@ def refresh_available_extensions_from_data(hide_tags, sort_column, filter_text="
 
 
 def preload_extensions_git_metadata():
-    t0 = time.time()
     for extension in extensions.extensions:
         extension.read_info_from_repo()
-    print(
-        f"preload_extensions_git_metadata for "
-        f"{len(extensions.extensions)} extensions took "
-        f"{time.time() - t0:.2f}s"
-    )
 
 
 def create_ui():
@@ -583,7 +564,8 @@ def create_ui():
             with gr.TabItem("Available", id="available"):
                 with gr.Row():
                     refresh_available_extensions_button = gr.Button(value="Load from:", variant="primary")
-                    available_extensions_index = gr.Text(value="https://raw.githubusercontent.com/AUTOMATIC1111/stable-diffusion-webui-extensions/master/index.json", label="Extension index URL").style(container=False)
+                    extensions_index_url = os.environ.get('WEBUI_EXTENSIONS_INDEX', "https://raw.githubusercontent.com/AUTOMATIC1111/stable-diffusion-webui-extensions/master/index.json")
+                    available_extensions_index = gr.Text(value=extensions_index_url, label="Extension index URL").style(container=False)
                     extension_to_install = gr.Text(elem_id="extension_to_install", visible=False)
                     install_extension_button = gr.Button(elem_id="install_extension_button", visible=False)
 
