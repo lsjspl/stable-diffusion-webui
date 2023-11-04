@@ -249,6 +249,15 @@ function popup(contents) {
     globalPopup.style.display = "flex";
 }
 
+var storedPopupIds = {};
+function popupId(id) {
+    if (!storedPopupIds[id]) {
+        storedPopupIds[id] = gradioApp().getElementById(id);
+    }
+
+    popup(storedPopupIds[id]);
+}
+
 function extraNetworksShowMetadata(text) {
     var elem = document.createElement('pre');
     elem.classList.add('popup-metadata');
@@ -332,7 +341,7 @@ function extraNetworksRefreshSingleCard(page, tabname, name) {
             newDiv.innerHTML = data.html;
             var newCard = newDiv.firstElementChild;
 
-            newCard.style = '';
+            newCard.style.display = '';
             card.parentElement.insertBefore(newCard, card);
             card.parentElement.removeChild(card);
         }

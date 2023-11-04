@@ -14,7 +14,7 @@ import ldm.modules.midas as midas
 
 from ldm.util import instantiate_from_config
 
-from modules import paths, shared, modelloader, devices, script_callbacks, sd_vae, sd_disable_initialization, errors, hashes, sd_models_config, sd_unet, sd_models_xl, cache
+from modules import paths, shared, modelloader, devices, script_callbacks, sd_vae, sd_disable_initialization, errors, hashes, sd_models_config, sd_unet, sd_models_xl, cache, extra_networks, processing, lowvram, sd_hijack
 from modules.timer import Timer
 import tomesd
 
@@ -25,6 +25,24 @@ checkpoints_list = {}
 checkpoint_aliases = {}
 checkpoint_alisases = checkpoint_aliases  # for compatibility with old name
 checkpoints_loaded = collections.OrderedDict()
+
+
+def replace_key(d, key, new_key, value):
+    keys = list(d.keys())
+
+    d[new_key] = value
+
+    if key not in keys:
+        return d
+
+    index = keys.index(key)
+    keys[index] = new_key
+
+    new_d = {k: d[k] for k in keys}
+
+    d.clear()
+    d.update(new_d)
+    return d
 
 
 class CheckpointInfo:
@@ -68,7 +86,9 @@ class CheckpointInfo:
         self.title = name if self.shorthash is None else f'{name} [{self.shorthash}]'
         self.short_title = self.name_for_extra if self.shorthash is None else f'{self.name_for_extra} [{self.shorthash}]'
 
-        self.ids = [self.hash, self.model_name, self.title, name, self.name_for_extra, f'{name} [{self.hash}]'] + ([self.shorthash, self.sha256, f'{self.name} [{self.shorthash}]'] if self.shorthash else [])
+        self.ids = [self.hash, self.model_name, self.title, name, self.name_for_extra, f'{name} [{self.hash}]']
+        if self.shorthash:
+            self.ids += [self.shorthash, self.sha256, f'{self.name} [{self.shorthash}]', f'{self.name_for_extra} [{self.shorthash}]']
 
     def register(self):
         checkpoints_list[self.title] = self
@@ -80,14 +100,20 @@ class CheckpointInfo:
         if self.sha256 is None:
             return
 
-        self.shorthash = self.sha256[0:10]
+        shorthash = self.sha256[0:10]
+        if self.shorthash == self.sha256[0:10]:
+            return self.shorthash
+
+        self.shorthash = shorthash
 
         if self.shorthash not in self.ids:
-            self.ids += [self.shorthash, self.sha256, f'{self.name} [{self.shorthash}]']
+            self.ids += [self.shorthash, self.sha256, f'{self.name} [{self.shorthash}]', f'{self.name_for_extra} [{self.shorthash}]']
 
-        checkpoints_list.pop(self.title, None)
+        old_title = self.title
         self.title = f'{self.name} [{self.shorthash}]'
         self.short_title = f'{self.name_for_extra} [{self.shorthash}]'
+
+        replace_key(checkpoints_list, old_title, self.title, self)
         self.register()
 
         return self.shorthash
@@ -141,6 +167,9 @@ re_strip_checksum = re.compile(r"\s*\[[^]]+]\s*$")
 
 
 def get_closet_checkpoint_match(search_string):
+    if not search_string:
+        return None
+
     checkpoint_info = checkpoint_aliases.get(search_string, None)
     if checkpoint_info is not None:
         return checkpoint_info
@@ -289,11 +318,27 @@ def get_checkpoint_state_dict(checkpoint_info: CheckpointInfo, timer):
     return res
 
 
+class SkipWritingToConfig:
+    """This context manager prevents load_model_weights from writing checkpoint name to the config when it loads weight."""
+
+    skip = False
+    previous = None
+
+    def __enter__(self):
+        self.previous = SkipWritingToConfig.skip
+        SkipWritingToConfig.skip = True
+        return self
+
+    def __exit__(self, exc_type, exc_value, exc_traceback):
+        SkipWritingToConfig.skip = self.previous
+
+
 def load_model_weights(model, checkpoint_info: CheckpointInfo, state_dict, timer):
     sd_model_hash = checkpoint_info.calculate_shorthash()
     timer.record("calculate hash")
 
-    shared.opts.data["sd_model_checkpoint"] = checkpoint_info.title
+    if not SkipWritingToConfig.skip:
+        shared.opts.data["sd_model_checkpoint"] = checkpoint_info.title
 
     if state_dict is None:
         state_dict = get_checkpoint_state_dict(checkpoint_info, timer)
@@ -318,7 +363,11 @@ def load_model_weights(model, checkpoint_info: CheckpointInfo, state_dict, timer
         model.to(memory_format=torch.channels_last)
         timer.record("apply channels_last")
 
-    if not shared.cmd_opts.no_half:
+    if shared.cmd_opts.no_half:
+        model.float()
+        devices.dtype_unet = torch.float32
+        timer.record("apply float()")
+    else:
         vae = model.first_stage_model
         depth_model = getattr(model, 'depth_model', None)
 
@@ -334,9 +383,9 @@ def load_model_weights(model, checkpoint_info: CheckpointInfo, state_dict, timer
         if depth_model:
             model.depth_model = depth_model
 
+        devices.dtype_unet = torch.float16
         timer.record("apply half()")
 
-    devices.dtype_unet = torch.float16 if model.is_sdxl and not shared.cmd_opts.no_half else model.model.diffusion_model.dtype
     devices.unet_needs_upcast = shared.cmd_opts.upcast_sampling and devices.dtype == torch.float16 and devices.dtype_unet == torch.float16
 
     model.first_stage_model.to(devices.dtype_vae)
@@ -356,7 +405,7 @@ def load_model_weights(model, checkpoint_info: CheckpointInfo, state_dict, timer
 
     sd_vae.delete_base_vae()
     sd_vae.clear_loaded_vae()
-    vae_file, vae_source = sd_vae.resolve_vae(checkpoint_info.filename)
+    vae_file, vae_source = sd_vae.resolve_vae(checkpoint_info.filename).tuple()
     sd_vae.load_vae(model, vae_file, vae_source)
     timer.record("load VAE")
 
@@ -457,8 +506,12 @@ class SdModelData:
 
         return self.sd_model
 
-    def set_sd_model(self, v):
+    def set_sd_model(self, v, already_loaded=False):
         self.sd_model = v
+        if already_loaded:
+            sd_vae.base_vae = getattr(v, "base_vae", None)
+            sd_vae.loaded_vae_file = getattr(v, "loaded_vae_file", None)
+            sd_vae.checkpoint_info = v.sd_checkpoint_info
 
         try:
             self.loaded_sd_models.remove(v)
@@ -473,7 +526,6 @@ model_data = SdModelData()
 
 
 def get_empty_cond(sd_model):
-    from modules import extra_networks, processing
 
     p = processing.StableDiffusionProcessingTxt2Img()
     extra_networks.activate(p, {})
@@ -486,9 +538,7 @@ def get_empty_cond(sd_model):
 
 
 def send_model_to_cpu(m):
-    from modules import lowvram
-
-    if shared.cmd_opts.lowvram or shared.cmd_opts.medvram:
+    if m.lowvram:
         lowvram.send_everything_to_cpu()
     else:
         m.to(devices.cpu)
@@ -496,12 +546,17 @@ def send_model_to_cpu(m):
     devices.torch_gc()
 
 
-def send_model_to_device(m):
-    from modules import lowvram
-
-    if shared.cmd_opts.lowvram or shared.cmd_opts.medvram:
-        lowvram.setup_for_low_vram(m, shared.cmd_opts.medvram)
+def model_target_device(m):
+    if lowvram.is_needed(m):
+        return devices.cpu
     else:
+        return devices.device
+
+
+def send_model_to_device(m):
+    lowvram.apply(m)
+
+    if not m.lowvram:
         m.to(shared.device)
 
 
@@ -559,7 +614,15 @@ def load_model(checkpoint_info=None, already_loaded_state_dict=None):
 
     timer.record("create model")
 
-    with sd_disable_initialization.LoadStateDictOnMeta(state_dict, devices.cpu):
+    if shared.cmd_opts.no_half:
+        weight_dtype_conversion = None
+    else:
+        weight_dtype_conversion = {
+            'first_stage_model': None,
+            '': torch.float16,
+        }
+
+    with sd_disable_initialization.LoadStateDictOnMeta(state_dict, device=model_target_device(sd_model), weight_dtype_conversion=weight_dtype_conversion):
         load_model_weights(sd_model, checkpoint_info, state_dict, timer)
     timer.record("load weights from state dict")
 
@@ -622,8 +685,14 @@ def reuse_model_from_already_loaded(sd_model, checkpoint_info, timer):
         send_model_to_device(already_loaded)
         timer.record("send model to device")
 
-        model_data.set_sd_model(already_loaded)
+        model_data.set_sd_model(already_loaded, already_loaded=True)
+
+        if not SkipWritingToConfig.skip:
+            shared.opts.data["sd_model_checkpoint"] = already_loaded.sd_checkpoint_info.title
+            shared.opts.data["sd_checkpoint_hash"] = already_loaded.sd_checkpoint_info.sha256
+
         print(f"Using already loaded model {already_loaded.sd_checkpoint_info.title}: done in {timer.summary()}")
+        sd_vae.reload_vae_weights(already_loaded)
         return model_data.sd_model
     elif shared.opts.sd_checkpoints_limit > 1 and len(model_data.loaded_sd_models) < shared.opts.sd_checkpoints_limit:
         print(f"Loading model {checkpoint_info.title} ({len(model_data.loaded_sd_models) + 1} out of {shared.opts.sd_checkpoints_limit})")
@@ -635,6 +704,10 @@ def reuse_model_from_already_loaded(sd_model, checkpoint_info, timer):
         sd_model = model_data.loaded_sd_models.pop()
         model_data.sd_model = sd_model
 
+        sd_vae.base_vae = getattr(sd_model, "base_vae", None)
+        sd_vae.loaded_vae_file = getattr(sd_model, "loaded_vae_file", None)
+        sd_vae.checkpoint_info = sd_model.sd_checkpoint_info
+
         print(f"Reusing loaded model {sd_model.sd_checkpoint_info.title} to load {checkpoint_info.title}")
         return sd_model
     else:
@@ -642,7 +715,6 @@ def reuse_model_from_already_loaded(sd_model, checkpoint_info, timer):
 
 
 def reload_model_weights(sd_model=None, info=None):
-    from modules import devices, sd_hijack
     checkpoint_info = info or select_checkpoint()
 
     timer = Timer()
@@ -692,19 +764,19 @@ def reload_model_weights(sd_model=None, info=None):
         script_callbacks.model_loaded_callback(sd_model)
         timer.record("script callbacks")
 
-        if not shared.cmd_opts.lowvram and not shared.cmd_opts.medvram:
+        if not sd_model.lowvram:
             sd_model.to(devices.device)
             timer.record("move model to device")
 
     print(f"Weights loaded in {timer.summary()}.")
 
     model_data.set_sd_model(sd_model)
+    sd_unet.apply_unet()
 
     return sd_model
 
 
 def unload_model_weights(sd_model=None, info=None):
-    from modules import devices, sd_hijack
     timer = Timer()
 
     if model_data.sd_model:
